@@ -1,3 +1,5 @@
+HVSR Implementation with Detailed Comments
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Adapted from BasicVSR++ network structure: "BasicVSR++: Improving Video Super-Resolution with Enhanced Propagation and Alignment"
 
@@ -16,7 +18,8 @@ from mmseg.utils import get_root_logger
 
 def dtof_hist_torch(d, img, rebin_idx, pitch, temp_res):
     """
-    Convert from predicted depth map into a histogram
+    Convert predicted depth map into a histogram for comparison with dToF sensor data
+    
     Args:
         d (tensor): predicted depth map with size (n*t, 1, h, w)
         img (tensor): input guidance image with size (n*t, 3, h, w)
@@ -29,20 +32,29 @@ def dtof_hist_torch(d, img, rebin_idx, pitch, temp_res):
     d = torch.clamp(d.clone(), min=0.0, max=1.0).to(img.device)
     B, _, H, W = d.shape ## same resolution as final output
     _, M, _, _ = rebin_idx.shape
+    
+    # Calculate albedo from input image
     albedo = torch.mean(img, dim=1).unsqueeze(1)
+    # Apply inverse square law for intensity falloff
     r = albedo / (1e-3 + d**2)
 
+    # Upsample rebin indices to match depth map resolution
     rebin_idx = torch.repeat_interleave(
         torch.repeat_interleave(rebin_idx, pitch, dim=2), pitch, dim=3
     ).detach()
+    
+    # Create histogram by comparing depth values with rebin indices
     hist = torch.sum(
         ((torch.round(d * (temp_res - 1)) - rebin_idx) >= 0).float(), dim=1
     ).unsqueeze(1)
 
+    # Convert to one-hot representation
     idx_volume = (
         torch.arange(1, M + 1).unsqueeze(0).unsqueeze(2).unsqueeze(3).float().to(img.device)
     )
     hist = ((hist - idx_volume) == 0).float()
+    
+    # Apply intensity weighting and downsample
     hist = torch.sum(
         (hist * r).view(B, M, H // pitch, pitch, W // pitch, pitch), dim=(3, 5)
     )
@@ -51,32 +63,37 @@ def dtof_hist_torch(d, img, rebin_idx, pitch, temp_res):
 
 def get_inp_error(cdf, rebin_idx, pred, img, pitch, temp_res):
     """
-    Get histogram matching error
+    Calculate histogram matching error between predicted depth and sensor measurements
+    
     Args:
-        cdf (tensor): input compressed cumulative distribution functions
-            with size (n*t, 2*self.mpeaks+2, h/s, w/s)
-        rebin_idx (tensor):
-            Compression rebin index (see 'datasets/dtof_simulator.py' for details)
-            with size (n*t, 2*self.mpeaks+2, h/s, w/s)
-        pred (tensor): predicted depth map with size (n*t, 1, h, w)
-        img (tensor): input guidance RGB image
-            with size  (n*t, 3, h, w)
-        pitch: size of each patch (iFoV), same as self.scale in main model
-        temp_res:
+        cdf (tensor): Input compressed cumulative distribution functions (n*t, 2*mpeaks+2, h/s, w/s)
+        rebin_idx (tensor): Compression rebin indices (n*t, 2*self.mpeaks+2, h/s, w/s)
+        pred (tensor): Predicted depth map (n*t, 1, h, w)
+        img (tensor): Input guidance RGB image (n*t, 3, h, w)
+        pitch: Size of each patch (iFoV), same as self.scale in main model
+        temp_res: Temporal resolution
+        
+    Returns:
+        tensor: Histogram matching error map
     """
     B, M, h, w = rebin_idx.shape
     delta_idx = rebin_idx[:, 1:] - rebin_idx[:, :-1]
 
+    # Normalize input CDFs
     cdf_inp = cdf / (torch.max(cdf, dim=1)[0].unsqueeze(1) + 1e-3)
 
+    # Generate histogram from prediction and convert to CDF
     hist_pred = dtof_hist_torch(pred, img, rebin_idx[:, :-1], pitch, temp_res)
     hist_pred = hist_pred / (torch.sum(hist_pred, dim=1).unsqueeze(1) + 1e-3)
     cdf_pred = torch.cumsum(hist_pred, dim=1).detach()
+    
+    # Calculate error between CDFs
     inp_error = torch.mean(
         torch.abs((cdf_inp[:, 1:] - cdf_pred) * delta_idx), dim=1
     ).unsqueeze(1)
     inp_error[torch.max(cdf_inp, axis=1)[0].unsqueeze(1) == 0] = -1
 
+    # Upsample error map
     inp_error = torch.repeat_interleave(
         torch.repeat_interleave(inp_error, pitch, dim=2), pitch, dim=3
     ).detach()
@@ -86,15 +103,22 @@ def get_inp_error(cdf, rebin_idx, pred, img, pitch, temp_res):
 
 def get_pos_encoding(B, T, H, W, pitch):
     """
-    Positional Encoding to assist alignment vector predictions
+    Generate positional encodings to assist alignment vector predictions
+    
     Args:
-        B, T, H, W: batch size, number of frames, height and weight of sequence
-            (same resolution as final output)
-        pitch: size of each patch (iFoV), same as self.scale in main model
+        B, T, H, W: Batch size, number of frames, height and width of sequence
+        pitch: Size of each patch (iFoV) same as self.scale in main model
+        
+    Returns:
+        tensor: Position encodings containing absolute positions, relative positions within patches,
+               and patch center positions
     """
+    # Create coordinate grids
     y, x = torch.meshgrid(torch.arange(H), torch.arange(W))
     y = y.unsqueeze(0).unsqueeze(1).float()
     x = x.unsqueeze(0).unsqueeze(1).float()
+    
+    # Calculate patch center coordinates
     patch_y = -torch.nn.MaxPool2d(kernel_size=pitch, stride=pitch)(-y)
     patch_x = -torch.nn.MaxPool2d(kernel_size=pitch, stride=pitch)(-x)
     patch_y = torch.repeat_interleave(
@@ -103,8 +127,12 @@ def get_pos_encoding(B, T, H, W, pitch):
     patch_x = torch.repeat_interleave(
         torch.repeat_interleave(patch_x, pitch, dim=2), pitch, dim=3
     )
+    
+    # Calculate relative positions within patches
     rel_y = y - patch_y
     rel_x = x - patch_x
+    
+    # Combine different position representations
     abs_pos = torch.cat((y / H, x / W), dim=1)
     rel_pos = torch.cat((rel_y / pitch, rel_x / pitch), dim=1)
     patch_pos = torch.cat((patch_y / H, patch_x / W), dim=1)
@@ -115,25 +143,23 @@ def get_pos_encoding(B, T, H, W, pitch):
 @BACKBONES.register_module()
 class HVSR(nn.Module):
     """
+    Hierarchical Video Super-Resolution Network for dToF Depth Enhancement
+    
+    The network consists of two stages:
+    1. Initial depth prediction using RGB guidance
+    2. Refinement using histogram matching error and positional encoding
+    
+    Each stage uses feature propagation with deformable alignment for temporal consistency.
+    
     Args:
-        mid_channels (int, optional): Channel number of the intermediate
-            features. Default: 64.
-        num_blocks (int, optional): The number of residual blocks in each
-            propagation branch. Default: 7.
-        scale: dToF sensor downsampling scale. Needs to be consistent with
-            loaded data.
-        max_residue_magnitude (int): The maximum magnitude of the offset
-            residue (Eq. 6 in paper). Default: 10.
-        is_low_res_input (bool, optional): Whether the input is low-resolution
-            or not. If False, the output resolution is equal to the input
-            resolution. Default: True.
-        spynet_pretrained (str, optional): Pre-trained model path of SPyNet.
-            Default: None.
-        cpu_cache_length (int, optional): When the length of sequence is larger
-            than this value, the intermediate features are sent to CPU. This
-            saves GPU memory, but slows down the inference speed. You can
-            increase this number if you have a GPU with large memory.
-            Default: 100.
+        dtof_args: Arguments for dToF sensor simulation
+        mid_channels (int): Channel number of intermediate features
+        num_blocks (int): Number of residual blocks in propagation branches
+        scale (int): dToF sensor downsampling scale
+        max_residue_magnitude (int): Maximum magnitude of offset residue
+        is_low_res_input (bool): Whether input is low-resolution
+        spynet_pretrained (str): Pre-trained model path for optical flow network
+        cpu_cache_length (int): Threshold for using CPU cache to save GPU memory
     """
 
     def __init__(
@@ -147,7 +173,6 @@ class HVSR(nn.Module):
         spynet_pretrained=None,
         cpu_cache_length=200,
     ):
-
         super().__init__()
         self.mid_channels = mid_channels
         self.is_low_res_input = is_low_res_input
@@ -158,13 +183,14 @@ class HVSR(nn.Module):
         self.mpeaks = self.args['mpeaks']
         self.temp_res = self.args['temp_res']
 
-        # optical flow
+        # Optical flow networks for both stages
         self.spynet = nn.ModuleDict()
         self.spynet["hg_1"] = SPyNet(pretrained=spynet_pretrained)
         self.spynet["hg_2"] = SPyNet(pretrained=spynet_pretrained)
 
-        # feature extraction module
+        # Feature extraction modules
         self.conv_guide_init = nn.ModuleDict()
+        # Stage 1: Process RGB guidance
         self.conv_guide_init["hg_1"] = nn.Sequential(
             nn.Conv2d(3, mid_channels, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(negative_slope=0.1, inplace=True),
@@ -175,6 +201,7 @@ class HVSR(nn.Module):
             nn.LeakyReLU(negative_slope=0.1, inplace=True),
             ResidualBlocksWithInputConv(mid_channels, mid_channels, 2),
         )
+        # Stage 2: Process depth, confidence, position encoding and error map
         self.conv_guide_init["hg_2"] = nn.Sequential(
             nn.Conv2d(2 + 6 + 1, mid_channels, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(negative_slope=0.1, inplace=True),
@@ -185,6 +212,8 @@ class HVSR(nn.Module):
             nn.LeakyReLU(negative_slope=0.1, inplace=True),
             ResidualBlocksWithInputConv(mid_channels, mid_channels, 2),
         )
+        
+        # Feature extraction after initial convolutions
         self.feat_extract = nn.ModuleDict()
         self.feat_extract["hg_1"] = ResidualBlocksWithInputConv(
             self.mpeaks + mid_channels, mid_channels, 5
@@ -193,7 +222,7 @@ class HVSR(nn.Module):
             self.mpeaks + mid_channels * 2, mid_channels, 5
         )
 
-        # propagation branches
+        # Propagation modules for both stages
         self.deform_align = nn.ModuleDict()
         self.deform_align["hg_1"] = nn.ModuleDict()
         self.deform_align["hg_2"] = nn.ModuleDict()
@@ -201,6 +230,7 @@ class HVSR(nn.Module):
         self.backbone["hg_1"] = nn.ModuleDict()
         self.backbone["hg_2"] = nn.ModuleDict()
 
+        # Initialize propagation modules for both forward and backward directions
         modules = ["backward_1", "forward_1", "backward_2", "forward_2"]
         for i, module in enumerate(modules):
             self.deform_align["hg_1"][module] = SecondOrderDeformableAlignment(
@@ -228,10 +258,10 @@ class HVSR(nn.Module):
                 (2 + i) * mid_channels, mid_channels, num_blocks
             )
 
-        # activation function
+        # Activation function
         self.lrelu = nn.LeakyReLU(negative_slope=0.1, inplace=True)
 
-        # upsampling module
+        # Reconstruction modules for both stages
         self.reconstruction = nn.ModuleDict()
         self.reconstruction["hg_1"] = ResidualBlocksWithInputConv(
             5 * mid_channels, mid_channels, 5
@@ -240,6 +270,7 @@ class HVSR(nn.Module):
             5 * mid_channels, mid_channels, 5
         )
 
+        # Final prediction layers for depth and confidence
         self.final_pred = nn.ModuleDict()
         self.final_pred["hg_1"] = nn.Sequential(
             PixelShufflePack(mid_channels, mid_channels, 2, upsample_kernel=3),
@@ -261,48 +292,58 @@ class HVSR(nn.Module):
             nn.Conv2d(64, 2, 3, 1, 1),
         )
 
+        # Upsampling and activation layers
         self.img_upsample = nn.Upsample(
             scale_factor=4, mode="bilinear", align_corners=False
         )
         self.softmax = nn.Softmax(dim=2)
 
-        # check if the sequence is augmented by flipping
+        # Flag for mirror-extended sequence
         self.is_mirror_extended = False
 
-    def check_if_mirror_extended(self, lqs):
-        """Check whether the input is a mirror-extended sequence.
-        If mirror-extended, the i-th (i=0, ..., t-1) frame is equal to the
-        (t-1-i)-th frame.
+def check_if_mirror_extended(self, lqs):
+        """Check whether the input sequence is mirror-extended.
+        
+        Mirror extension means the sequence is reflected around its midpoint,
+        where frame i equals frame (t-1-i). For example, in a 6-frame sequence:
+        [0,1,2,2,1,0] is mirror-extended.
+        
         Args:
-            lqs (tensor): Input low quality (LQ) sequence with
-                shape (n, t, c, h, w).
+            lqs (tensor): Input low quality sequence with shape (n, t, c, h, w)
+                where n=batch size, t=sequence length, c=channels, h=height, w=width
         """
-
+        # Only check if sequence length is even
         if lqs.size(1) % 2 == 0:
+            # Split sequence into two equal halves
             lqs_1, lqs_2 = torch.chunk(lqs, 2, dim=1)
+            # Check if first half equals second half reversed
+            # If norm is 0, sequences are identical
             if torch.norm(lqs_1 - lqs_2.flip(1)) == 0:
                 self.is_mirror_extended = True
 
     def compute_flow(self, guides, hg_idx):
-        """Compute optical flow using SPyNet for feature alignment.
-        Note that if the input is an mirror-extended sequence, 'flows_forward'
-        is not needed, since it is equal to 'flows_backward.flip(1)'.
+        """Compute optical flow between consecutive frames using SPyNet.
+        
+        For mirror-extended sequences, only backward flow is computed since
+        forward flow can be derived from backwards flow.
+        
         Args:
-            guides (tensor): Input low quality (LQ) sequence with
-                shape (n, t, c, h, w).
-            hg_idx: Identify processing stage: init stage or refine stage
-        Return:
-            tuple(Tensor): Optical flow. 'flows_forward' corresponds to the
-                flows used for forward-time propagation (current to previous).
-                'flows_backward' corresponds to the flows used for
-                backward-time propagation (current to next).
+            guides (tensor): Input sequence, shape (n, t, c, h, w)
+            hg_idx: Stage identifier (1=initial stage, 2=refinement stage)
+        
+        Returns:
+            tuple(Tensor): Forward and backward optical flows:
+                - flows_forward: Flow from current to previous frame
+                - flows_backward: Flow from current to next frame
+                Both have shape (n, t-1, 2, h, w)
         """
-
-        n, t, c, h, w = guides.size() ## same resolution as final output
-        guides_1 = guides[:, :-1, :, :, :]
-        guides_2 = guides[:, 1:, :, :, :]
+        n, t, c, h, w = guides.size()
+        # Split into consecutive pairs for flow computation 
+        guides_1 = guides[:, :-1, :, :, :]  # frames 0 to t-1
+        guides_2 = guides[:, 1:, :, :, :]   # frames 1 to t
         
         if self.cpu_cache:
+            # Process frames sequentially when using CPU cache
             flows_backward = []
             for tt in range(t-1):
                 fb = self.spynet[f"hg_{hg_idx}"](guides_1[:,tt], guides_2[:,tt])
@@ -310,23 +351,24 @@ class HVSR(nn.Module):
             flows_backward = torch.cat(flows_backward, dim = 1)
         
         else:
+            # Process all frames at once if memory allows
             guides_1 = guides_1.reshape(-1, c, h, w)
             guides_2 = guides_2.reshape(-1, c, h, w)
             flows_backward = self.spynet[f"hg_{hg_idx}"](guides_1, guides_2).view(
                 n, t - 1, 2, h, w
             )
         
-        if self.is_mirror_extended:  # flows_forward = flows_backward.flip(1)
+        # For mirror-extended sequences, forward flow is backward flow reversed
+        if self.is_mirror_extended:
             flows_forward = None
         else:
-            
             if self.cpu_cache:
+                # Sequential processing for forward flows
                 flows_forward = []
                 for tt in range(t-1):
                     ff = self.spynet[f"hg_{hg_idx}"](guides_2[:,tt], guides_1[:,tt])
                     flows_forward.append(ff.unsqueeze(1))
                 flows_forward = torch.cat(flows_forward, dim = 1)
-
             else:
                 guides_1 = guides_1.reshape(-1, c, h, w)
                 guides_2 = guides_2.reshape(-1, c, h, w)
@@ -334,6 +376,7 @@ class HVSR(nn.Module):
                     n, t - 1, 2, h, w
                 )
         
+        # Move flows to CPU if using CPU cache to save GPU memory
         if self.cpu_cache:
             flows_backward = flows_backward.cpu()
             flows_forward = flows_forward.cpu()
@@ -341,51 +384,61 @@ class HVSR(nn.Module):
         return flows_forward, flows_backward
 
     def propagate(self, feats, flows, module_name, hg_idx):
-        """Propagate the latent features throughout the sequence.
+        """Propagate features through the sequence using deformable convolution.
+        
+        Implements bi-directional feature propagation with second-order motion
+        compensation using deformable convolution.
+        
         Args:
-            feats dict(list[tensor]): Features from previous branches. Each
-                component is a list of tensors with shape (n, c, h/4, w/4).
-            flows (tensor): Optical flows with shape (n, t - 1, 2, h/4, w/4).
-            module_name (str): The name of the propagation branches. Can either
-                be 'backward_1', 'forward_1', 'backward_2', 'forward_2'.
-            hg_idx: Identify processing stage: init stage or refine stage
-        Return:
-            dict(list[tensor]): A dictionary containing all the propagated
-                features. Each key in the dictionary corresponds to a
-                propagation branch, which is represented by a list of tensors.
+            feats dict(list[tensor]): Previous branch features
+                Each key maps to list of tensors with shape (n, c, h/4, w/4)
+            flows (tensor): Optical flows, shape (n, t-1, 2, h/4, w/4) 
+            module_name (str): Branch identifier:
+                'backward_1', 'forward_1', 'backward_2', or 'forward_2'
+            hg_idx: Stage identifier (1=initial, 2=refinement)
+            
+        Returns:
+            dict(list[tensor]): Updated feature dictionary with propagated features
         """
+        n, t, _, h, w = flows.size()
 
-        n, t, _, h, w = flows.size() ## 1/4 resolution of final output
-
+        # Generate frame indices for propagation
         frame_idx = range(0, t + 1)
         flow_idx = range(-1, t)
+        # Create mapping for handling mirror-extended sequences
         mapping_idx = list(range(0, len(feats["spatial"])))
         mapping_idx += mapping_idx[::-1]
 
+        # Reverse indices for backward propagation
         if "backward" in module_name:
             frame_idx = frame_idx[::-1]
             flow_idx = frame_idx
 
+        # Initialize feature propagation tensor
         feat_prop = flows.new_zeros(n, self.mid_channels, h, w)
+        
+        # Main propagation loop
         for i, idx in enumerate(frame_idx):
             feat_current = feats["spatial"][mapping_idx[idx]]
             if self.cpu_cache:
                 feat_current = feat_current.cuda()
                 feat_prop = feat_prop.cuda()
-            # second-order deformable alignment
+                
+            # Apply second-order deformable alignment after first frame
             if i > 0:
+                # Get first-order flow and features
                 flow_n1 = flows[:, flow_idx[i], :, :, :]
                 if self.cpu_cache:
                     flow_n1 = flow_n1.cuda()
-
                 cond_n1 = flow_warp(feat_prop, flow_n1.permute(0, 2, 3, 1))
 
-                # initialize second-order features
+                # Initialize second-order terms
                 feat_n2 = torch.zeros_like(feat_prop)
                 flow_n2 = torch.zeros_like(flow_n1)
                 cond_n2 = torch.zeros_like(cond_n1)
 
-                if i > 1:  # second-order features
+                # Compute second-order terms if available
+                if i > 1:
                     feat_n2 = feats[module_name][-2]
                     if self.cpu_cache:
                         feat_n2 = feat_n2.cuda()
@@ -394,18 +447,18 @@ class HVSR(nn.Module):
                     if self.cpu_cache:
                         flow_n2 = flow_n2.cuda()
 
+                    # Compose flows for second-order motion
                     flow_n2 = flow_n1 + flow_warp(flow_n2, flow_n1.permute(0, 2, 3, 1))
                     cond_n2 = flow_warp(feat_n2, flow_n2.permute(0, 2, 3, 1))
 
-                # flow-guided deformable convolution
+                # Concatenate features for deformable alignment
                 cond = torch.cat([cond_n1, feat_current, cond_n2], dim=1)
                 feat_prop = torch.cat([feat_prop, feat_n2], dim=1)
                 feat_prop = self.deform_align[f"hg_{hg_idx}"][module_name](
                     feat_prop, cond, flow_n1, flow_n2
                 )
 
-            # concatenate and residual blocks
-
+            # Aggregate features and apply residual learning
             feat = (
                 [feat_current]
                 + [feats[k][idx] for k in feats if k not in ["spatial", module_name]]
@@ -418,10 +471,12 @@ class HVSR(nn.Module):
             feat_prop = feat_prop + self.backbone[f"hg_{hg_idx}"][module_name](feat)
             feats[module_name].append(feat_prop)
 
+            # Move features to CPU if using CPU cache
             if self.cpu_cache:
                 feats[module_name][-1] = feats[module_name][-1].cpu()
                 torch.cuda.empty_cache()
 
+        # Reverse feature order for backward propagation
         if "backward" in module_name:
             feats[module_name] = feats[module_name][::-1]
 
